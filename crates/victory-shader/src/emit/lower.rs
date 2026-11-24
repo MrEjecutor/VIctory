@@ -2878,7 +2878,6 @@ impl<'a> Lower<'a> {
             }
             return Ok(());
         }
-        let h = self.handle(site, src, false, (13, 0x1_0000))?;
         let constant = match addr {
             V::Const(_)
                 if matches!(soffset, Operand::Scalar { code: NULL, .. }) && extra.is_none() =>
@@ -2887,7 +2886,74 @@ impl<'a> Lower<'a> {
             }
             _ => None,
         };
+        // A descriptor of no listed kind (one picked from the view heap by
+        // an index the program computes) holds a constant buffer or a buffer
+        // view, and only the host knows which: its runtime stride table has a
+        // stride for a buffer view and 0 for anything else. Read as a
+        // constant buffer, a buffer view gives nothing (an RTX 5060 Ti reads
+        // zeros), so the load that fits the slot runs, each with its own
+        // handle in its own branch (the condition is scalar data: uniform).
+        if kind.is_none()
+            && let Ok([_, stride, _]) = self.stride_entry(src)
+        {
+            let zero = self.s.m.i32(0);
+            let is_buffer = self.s.m.cmp(self.cur, pred::NE, stride, zero);
+            let raw_at = self.begin_guarded(Some(is_buffer));
+            let mut raw_inside = Vec::with_capacity(count as usize);
+            for k in 0..count {
+                let c = self.cur;
+                let off = self.s.m.i32(4 * k);
+                let off = self.s.m.bin(c, Bin::Add, addr, off);
+                let index = self.s.m.i32(0);
+                let (h, byte) = self.runtime_view(src, index, off, 11)?;
+                let u = self.s.m.undef(self.s.t.i32);
+                let mask = self.s.m.i8(1);
+                let align = self.s.m.i32(4);
+                let r = self.s.op(
+                    self.cur,
+                    "rawBufferLoad.f32",
+                    Attr::ReadOnly,
+                    self.s.t.res_ret,
+                    139,
+                    &[h, byte, u, mask, align],
+                );
+                let x = self.s.m.extract(self.cur, r, 0);
+                raw_inside.push(self.as_int(x));
+            }
+            let raw_pairs: Vec<_> = raw_inside.iter().map(|&x| (x, zero)).collect();
+            let raw_values = self.end_guarded(raw_at, &raw_pairs);
+
+            let is_constant = self.s.m.cmp(self.cur, pred::EQ, stride, zero);
+            let constant_at = self.begin_guarded(Some(is_constant));
+            let inside = self.scalar_cbuffer_loads(site, src, addr, count, constant)?;
+            let pairs: Vec<_> = inside.into_iter().zip(raw_values).collect();
+            let values = self.end_guarded(constant_at, &pairs);
+            for (k, x) in values.into_iter().enumerate() {
+                self.write(inst, Reg::S(code + k as u8), x, None);
+            }
+            return Ok(());
+        }
+        let values = self.scalar_cbuffer_loads(site, src, addr, count, constant)?;
+        for (k, x) in values.into_iter().enumerate() {
+            self.write(inst, Reg::S(code + k as u8), x, None);
+        }
+        Ok(())
+    }
+
+    /// `count` dwords at byte `addr` (`constant`: its value when it is one)
+    /// of the constant buffer `src`, read in the current block.
+    fn scalar_cbuffer_loads(
+        &mut self,
+        site: Site,
+        src: &Source,
+        addr: V,
+        count: u32,
+        constant: Option<u32>,
+    ) -> Result<Vec<V>, Why> {
+        let h = self.handle(site, src, false, (13, 0x1_0000))?;
+        let c = self.cur;
         let mut rows: HashMap<u32, V> = HashMap::new();
+        let mut values = Vec::with_capacity(count as usize);
         for k in 0..count {
             let x = match constant {
                 Some(base) => {
@@ -2916,9 +2982,9 @@ impl<'a> Lower<'a> {
                     self.cbuffer_dword(h, a)
                 }
             };
-            self.write(inst, Reg::S(code + k as u8), x, None);
+            values.push(x);
         }
-        Ok(())
+        Ok(values)
     }
 
     /// A descriptor load (`s_load_dword*` from a table or heap) whose dwords

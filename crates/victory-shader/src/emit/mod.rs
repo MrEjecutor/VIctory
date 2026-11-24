@@ -1162,6 +1162,207 @@ mod tests {
         }
     }
 
+    /// A table at `s4` holds an index buffer (slot 0) and the output (slot
+    /// 1); the descriptor read is picked from the view heap itself (`s5`, a
+    /// `ResourceHeap` parameter) by the index loaded, so no used-resource
+    /// entry says what kind of view it is.
+    const HEAP_SCALAR_WORDS: &[u32] = &[
+        0xBE94_0304, // s_mov_b32 s20, s4
+        0xBE95_0380, // s_mov_b32 s21, 0
+        0xBE96_0305, // s_mov_b32 s22, s5
+        0xBE97_0380, // s_mov_b32 s23, 0
+        0xF408_040A,
+        0xFA00_0000, // s_load_dwordx4 s[16:19], s[20:21], 0x0
+        0xBE87_0380, // s_mov_b32 s7, 0
+        0xF420_0188,
+        0x0E00_0000, // s_buffer_load_dword s6, s[16:19], s7
+        0x8F06_8506, // s_lshl_b32 s6, s6, 5
+        0xF408_020B,
+        0x0C00_0000, // s_load_dwordx4 s[8:11], s[22:23], s6
+        0xF420_0604,
+        0x0E00_0000, // s_buffer_load_dword s24, s[8:11], s7
+        0xF424_0684,
+        0x0E00_0004, // s_buffer_load_dwordx2 s[26:27], s[8:11], s7, 4
+        0xF408_030A,
+        0xFA00_0020, // s_load_dwordx4 s[12:15], s[20:21], 0x20
+        0x7E04_0218, // v_mov_b32 v2, s24
+        0x7E02_0280, // v_mov_b32 v1, 0
+        0xE070_3000,
+        0x8003_0200, // buffer_store_dword v2, v[0:1], s[12:15], 0 idxen offen
+        0x7E04_021A, // v_mov_b32 v2, s26
+        0x7E02_0284, // v_mov_b32 v1, 4
+        0xE070_3000,
+        0x8003_0200, // buffer_store_dword v2, v[0:1], s[12:15], 0 idxen offen
+        0x7E04_021B, // v_mov_b32 v2, s27
+        0x7E02_0288, // v_mov_b32 v1, 8
+        0xE070_3000,
+        0x8003_0200, // buffer_store_dword v2, v[0:1], s[12:15], 0 idxen offen
+        0xBF81_0000, // s_endpgm
+    ];
+
+    /// [`HEAP_SCALAR_WORDS`] lowered (and validated when `dxil.dll` is
+    /// there): user SGPRs `s0..s5`, the table at `s4`, the view heap at `s5`.
+    fn heap_scalar_program() -> super::lower::Lowered {
+        let used = |kind, table_offset_dwords| crate::UsedResource {
+            kind,
+            root: crate::RootType::Table,
+            table_offset_dwords,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 4,
+            user_data: 4,
+            slot: 1,
+        };
+        let param = |root, sgprs, user_data, slot| crate::RootParam {
+            root,
+            table_offset_dwords: 0,
+            sgprs,
+            base_register: 0,
+            user_data,
+            slot,
+        };
+        let native = super::NativeProgram {
+            stage: super::HwStage::Cs,
+            wave64: false,
+            vgprs: 4,
+            layout: vec![
+                param(crate::RootType::Constants, 4, 0, 0),
+                param(crate::RootType::Table, 1, 4, 1),
+                param(crate::RootType::ResourceHeap, 1, 5, 2),
+            ],
+            used: vec![
+                used(crate::ResourceType::Srv, 0),
+                used(crate::ResourceType::Uav, 8),
+            ],
+            io: crate::native::StageIo::Cs(crate::native::ComputeIo {
+                rsrc2: 6 << 1,
+                threads: [1, 1, 1],
+            }),
+            code: HEAP_SCALAR_WORDS
+                .iter()
+                .flat_map(|w| w.to_le_bytes())
+                .collect(),
+        };
+        let p = crate::ir::build(&native.code, native.wave64, native.vgprs).unwrap();
+        let st = crate::structure::structure(&p).unwrap();
+        let res = crate::resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = crate::io::raise(&p, &native).unwrap();
+        let mut l = super::lower::lower(&super::lower::Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            prims: Vec::new(),
+            mesh_stride: 0,
+        })
+        .unwrap();
+        #[cfg(windows)]
+        if let Ok(mut v) = super::validator::Validator::load(
+            super::validator::Validator::default_path().as_deref(),
+        ) {
+            v.validate(&mut l.dxil).unwrap();
+        }
+        #[cfg(not(windows))]
+        let _ = &mut l;
+        l
+    }
+
+    #[test]
+    fn scalar_loads_of_a_view_picked_from_the_heap_translate() {
+        let l = heap_scalar_program();
+        assert!(l.stride_table);
+    }
+
+    /// Scalar buffer loads of a view picked from the heap by a loaded index,
+    /// with no used-resource entry: the runtime stride table says what the
+    /// slot holds. A buffer view (stride not 0) is read through its raw
+    /// alias; anything else is read as a constant buffer, as before.
+    #[test]
+    fn scalar_loads_of_a_view_picked_from_the_heap_read_it_as_what_it_is() {
+        let l = heap_scalar_program();
+        #[cfg(not(windows))]
+        let _ = l;
+        #[cfg(windows)]
+        {
+            use super::StrideEntry;
+            use super::host::{Dispatch, Root, Stride, View};
+            let cs = compute_shader(l);
+            let indices = [2];
+            let structured = [0x1122_3344, 0x5566_7788, 0x99AA_BBCC, 0xDDEE_FF00];
+            let constants = [0x1020_3040, 0x5060_7080, 0x90A0_B0C0];
+            let _one = one_at_a_time();
+            for (name, host) in hosts() {
+                let (root, pso) = host.compute_pipeline(&cs).unwrap();
+                let (raw, buffer_entry) = raw_view_of(2, 3, (0, 1, 16));
+                let cases = [
+                    (
+                        "structured SRV",
+                        View::Buffer {
+                            data: &structured,
+                            stride: Stride::Structured(16),
+                        },
+                        buffer_entry,
+                        Some(raw),
+                        [structured[0], structured[1], structured[2]],
+                    ),
+                    (
+                        "constant buffer",
+                        View::Cbv(&constants),
+                        StrideEntry::default(),
+                        None,
+                        [constants[0], constants[1], constants[2]],
+                    ),
+                ];
+                for (kind, target, entry, raw_alias, want) in cases {
+                    let raw_index = StrideEntry {
+                        stride: 4,
+                        ..StrideEntry::default()
+                    };
+                    let table: Vec<u32> = [raw_index, StrideEntry::default(), entry]
+                        .into_iter()
+                        .flat_map(StrideEntry::words)
+                        .collect();
+                    let mut views = vec![
+                        View::Buffer {
+                            data: &indices,
+                            stride: Stride::Raw,
+                        },
+                        View::RawUav(16),
+                        target,
+                    ];
+                    if let Some(raw_alias) = raw_alias {
+                        views.push(raw_alias);
+                    }
+                    let out = host
+                        .dispatch(
+                            &root,
+                            &pso,
+                            &Dispatch {
+                                roots: vec![
+                                    (0, Root::Constants(vec![0; 6])),
+                                    (
+                                        1,
+                                        Root::View {
+                                            srv: true,
+                                            data: table,
+                                        },
+                                    ),
+                                ],
+                                views: &views,
+                                samplers: &[],
+                                groups: [1, 1, 1],
+                            },
+                        )
+                        .unwrap();
+                    assert_eq!(&out[0][..3], &want, "{kind} on {name}");
+                }
+            }
+        }
+    }
+
     /// The descriptor of an unknown-stride read chosen by control flow: the
     /// table entry read is the chosen slot's.
     #[test]
