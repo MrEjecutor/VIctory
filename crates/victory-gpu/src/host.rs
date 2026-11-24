@@ -69,6 +69,15 @@ pub(crate) enum InplaceFailure {
     PlacedResource,
 }
 
+/// Logs the first few HRESULTs of a failed in-place step (the reason counts say
+/// which step failed, not why).
+fn inplace_error(step: &'static str, e: &windows::core::Error) {
+    static LOGGED: AtomicU32 = AtomicU32::new(0);
+    if LOGGED.fetch_add(1, Ordering::Relaxed) < 8 {
+        tracing::warn!(step, hr = format_args!("{:#010x}", e.code().0), error = %e, "in-place buffer step failed");
+    }
+}
+
 /// Open once for each live title allocation; shadows keep the heap alive.
 static INPLACE_HEAPS: OnceLock<Mutex<HashMap<usize, Weak<ID3D12Heap>>>> = OnceLock::new();
 
@@ -1951,12 +1960,18 @@ impl Host {
                 let device = self
                     .device
                     .cast::<ID3D12Device3>()
-                    .map_err(|_| InplaceFailure::OpenHeap)?;
+                    .map_err(|e| {
+                        inplace_error("ID3D12Device3", &e);
+                        InplaceFailure::OpenHeap
+                    })?;
                 // SAFETY: `allocation` is the AllocationBase returned by VirtualQuery.
                 let heap = unsafe {
                     device.OpenExistingHeapFromAddress::<ID3D12Heap>(allocation as *const _)
                 }
-                .map_err(|_| InplaceFailure::OpenHeap)?;
+                .map_err(|e| {
+                    inplace_error("OpenExistingHeapFromAddress", &e);
+                    InplaceFailure::OpenHeap
+                })?;
                 let heap = Arc::new(heap);
                 cache.insert(allocation, Arc::downgrade(&heap));
                 heap
@@ -1988,7 +2003,10 @@ impl Host {
                 &mut buffer,
             )
         }
-        .map_err(|_| InplaceFailure::PlacedResource)?;
+        .map_err(|e| {
+            inplace_error("CreatePlacedResource", &e);
+            InplaceFailure::PlacedResource
+        })?;
         let buffer = buffer.ok_or(InplaceFailure::PlacedResource)?;
         // SAFETY: a live placed buffer.
         let gpu = unsafe { buffer.GetGPUVirtualAddress() };

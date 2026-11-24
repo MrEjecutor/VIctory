@@ -467,21 +467,27 @@ fn direct_buffer(
     start: u64,
     len: u64,
 ) -> Result<(ID3D12Resource, u64, Arc<ID3D12Heap>), InplaceFailure> {
-    let size = len
-        .max(1)
-        .checked_add(RESOURCE_ALIGN - 1)
+    // Placed resources sit on 64 KiB boundaries of the heap, and title buffers
+    // mostly do not start on one: place from the boundary at or below `start`
+    // (allocation bases are 64 KiB aligned) and hand out `start`'s address in it.
+    let first = allocation_for_range(start, len.max(1))?;
+    let offset = start
+        .checked_sub(first as u64)
+        .ok_or(InplaceFailure::DifferentAllocation)?;
+    let place = first as u64 + (offset & !(RESOURCE_ALIGN - 1));
+    let size = (start - place)
+        .checked_add(len.max(1))
+        .and_then(|size| size.checked_add(RESOURCE_ALIGN - 1))
         .map(|size| size & !(RESOURCE_ALIGN - 1))
         .ok_or(InplaceFailure::Query)?;
-    let allocation = allocation_for_range(start, size)?;
-    let offset = start
-        .checked_sub(allocation as u64)
-        .ok_or(InplaceFailure::DifferentAllocation)?;
-    if offset % RESOURCE_ALIGN != 0 {
-        return Err(InplaceFailure::Unaligned);
+    let allocation = allocation_for_range(place, size)?;
+    if allocation != first {
+        return Err(InplaceFailure::DifferentAllocation);
     }
-    host()
+    let (buffer, gpu, heap) = host()
         .ok_or(InplaceFailure::OpenHeap)?
-        .inplace_buffer(allocation, start, size)
+        .inplace_buffer(allocation, place, size)?;
+    Ok((buffer, gpu + (start - place), heap))
 }
 
 fn fallback(start: u64, len: u64, reason: InplaceFailure) {
