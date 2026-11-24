@@ -5,7 +5,8 @@
 //! overlap them with per-submission fences once more than clears run.
 
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
@@ -54,6 +55,22 @@ pub(crate) struct Host {
     next_rtv: AtomicU32,
     presenter: Mutex<Option<Presenter>>,
 }
+
+/// Why a title buffer could not use a placed resource over its own memory.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum InplaceFailure {
+    Query,
+    Mapped,
+    NotPrivate,
+    NotCommitted,
+    DifferentAllocation,
+    Unaligned,
+    OpenHeap,
+    PlacedResource,
+}
+
+/// Open once for each live title allocation; shadows keep the heap alive.
+static INPLACE_HEAPS: OnceLock<Mutex<HashMap<usize, Weak<ID3D12Heap>>>> = OnceLock::new();
 
 // SAFETY: D3D12 devices, queues, fences and descriptor heaps are
 // free-threaded; the event handle is only waited on under `submitted`.
@@ -1231,7 +1248,7 @@ impl HostList {
                 }
                 Step::Refresh(shadow, address, len) => {
                     #[cfg(feature = "diagnostics")]
-                    {
+                    if !shadow.direct() {
                         add(C::Refreshes, 1);
                         add(C::RefreshBytes, *len as u64);
                     }
@@ -1312,6 +1329,11 @@ impl Batch {
 
     fn flush(&mut self) {
         for (shadow, from, to) in self.refreshes.drain(..) {
+            if shadow.direct() {
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::add(crate::copystat::C::DirectBytes, (to - from) as u64);
+                continue;
+            }
             let started = std::time::Instant::now();
             let copied = shadow.update(from, to - from);
             let us = started.elapsed().as_micros() as u64;
@@ -1907,6 +1929,75 @@ pub(crate) fn legal_for(flags: u32, state: u32) -> u32 {
 }
 
 impl Host {
+    /// Makes a UAV-capable D3D12 buffer over title memory. The shadow retains
+    /// the heap so this cache can be weak and does not survive a freed allocation.
+    pub(crate) fn inplace_buffer(
+        &self,
+        allocation: usize,
+        start: u64,
+        size: u64,
+    ) -> Result<(ID3D12Resource, u64, Arc<ID3D12Heap>), InplaceFailure> {
+        let offset = start
+            .checked_sub(allocation as u64)
+            .ok_or(InplaceFailure::DifferentAllocation)?;
+        if offset % (64 << 10) != 0 {
+            return Err(InplaceFailure::Unaligned);
+        }
+        let cache = INPLACE_HEAPS.get_or_init(|| Mutex::new(HashMap::new()));
+        let mut cache = cache.lock().unwrap_or_else(|e| e.into_inner());
+        let heap = match cache.get(&allocation).and_then(Weak::upgrade) {
+            Some(heap) => heap,
+            None => {
+                let device = self
+                    .device
+                    .cast::<ID3D12Device3>()
+                    .map_err(|_| InplaceFailure::OpenHeap)?;
+                // SAFETY: `allocation` is the AllocationBase returned by VirtualQuery.
+                let heap = unsafe {
+                    device.OpenExistingHeapFromAddress::<ID3D12Heap>(allocation as *const _)
+                }
+                .map_err(|_| InplaceFailure::OpenHeap)?;
+                let heap = Arc::new(heap);
+                cache.insert(allocation, Arc::downgrade(&heap));
+                heap
+            }
+        };
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: size.max(1),
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+            ..Default::default()
+        };
+        let mut buffer: Option<ID3D12Resource> = None;
+        // SAFETY: the heap covers this VirtualAlloc allocation and the offset is aligned.
+        unsafe {
+            self.device.CreatePlacedResource(
+                &*heap,
+                offset,
+                &desc,
+                D3D12_RESOURCE_STATE_COMMON,
+                None,
+                &mut buffer,
+            )
+        }
+        .map_err(|_| InplaceFailure::PlacedResource)?;
+        let buffer = buffer.ok_or(InplaceFailure::PlacedResource)?;
+        // SAFETY: a live placed buffer.
+        let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+        if gpu == 0 || gpu.checked_add(size).is_none() {
+            return Err(InplaceFailure::PlacedResource);
+        }
+        Ok((buffer, gpu, heap))
+    }
+
     /// A buffer in system memory that the CPU maps (write-back, so reading
     /// it is fast too) and shaders read and write: for host copies of title
     /// memory that shaders write, which upload memory cannot be. Starts in

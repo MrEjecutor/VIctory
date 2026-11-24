@@ -1,14 +1,14 @@
 //! Host copies of title buffers (decision 0007, step 3 and "Copies of title
-//! memory"). Title buffers are title memory, which the host GPU cannot
-//! read, so a buffer a draw uses gets a persistent host buffer of its size
+//! memory"), with an opt-in placed-buffer path for eligible private memory.
+//! Ordinarily a buffer a draw uses gets a persistent host buffer of its size
 //! on first use (system memory shaders may also write), and the ranges each
 //! submission reads (vertex, index and constant data, buffer views) are
 //! brought up to date from title memory before it runs: the 64 KiB pages
 //! the title wrote since they were last copied ([`crate::watch`]: write
 //! watching, or read-only guards on physical-page views), all of it where
 //! neither works. A title GPU address inside the buffer is the same offset
-//! in its copy. Ranges shaders write go back to title memory after the
-//! submission ([`Shadow::gpu_writes`]).
+//! in its copy. Ranges shaders write go back after the submission; direct
+//! resources instead let the GPU write title memory in place.
 //!
 //! shortcut: only the ranges draws are known to read are brought up to
 //! date (vertex and index buffer views, constant buffers in tables, root
@@ -17,16 +17,21 @@
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU8, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
-use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
+use windows::Win32::Graphics::Direct3D12::{ID3D12Heap, ID3D12Resource};
+use windows_sys::Win32::System::Memory::{
+    MEMORY_BASIC_INFORMATION, MEM_COMMIT, MEM_MAPPED, MEM_PRIVATE, VirtualQuery,
+};
 
-use crate::host::{HostList, host};
+use crate::host::{HostList, InplaceFailure, host};
 use crate::watch::PAGE;
 
-/// A title buffer's host copy.
+/// A title buffer's host copy or direct placed resource.
 pub(crate) struct Shadow {
     pub(crate) buffer: ID3D12Resource,
+    direct: bool,
+    _heap: Option<Arc<ID3D12Heap>>,
     data: *mut u8,
     gpu: u64,
     /// Where the title buffer starts and how long it is.
@@ -77,13 +82,17 @@ fn give_back(v: Vec<u8>) {
 
 const NOT_WATCHED: u8 = 2;
 
-// SAFETY: D3D12 resources are free-threaded; `data` is a persistent mapping
-// written only on the submitting thread.
+// SAFETY: D3D12 resources are free-threaded; copied `data` is a persistent
+// mapping written only on the submitting thread and is null for direct buffers.
 unsafe impl Send for Shadow {}
 // SAFETY: as above.
 unsafe impl Sync for Shadow {}
 
 impl Shadow {
+    pub(crate) fn direct(&self) -> bool {
+        self.direct
+    }
+
     /// The host GPU address of a title address inside the buffer.
     pub(crate) fn gpu(&self, address: u64) -> u64 {
         self.gpu + (address - self.start)
@@ -106,16 +115,26 @@ impl Shadow {
         list.defer_refresh(self, address as usize, len as usize);
     }
 
-    fn new(buffer: ID3D12Resource, data: *mut u8, gpu: u64, start: u64, len: u64) -> Shadow {
+    fn new(
+        buffer: ID3D12Resource,
+        data: *mut u8,
+        gpu: u64,
+        heap: Option<Arc<ID3D12Heap>>,
+        start: u64,
+        len: u64,
+    ) -> Shadow {
+        let direct = heap.is_some();
         let pages = (start + len).div_ceil(PAGE as u64) - start / PAGE as u64;
         Shadow {
             buffer,
+            direct,
+            _heap: heap,
             data,
             gpu,
             start,
             len,
-            copied: Mutex::new(vec![0; pages as usize]),
-            watched: AtomicU8::new(0),
+            copied: Mutex::new(if direct { Vec::new() } else { vec![0; pages as usize] }),
+            watched: AtomicU8::new(if direct { NOT_WATCHED } else { 0 }),
             pending: Mutex::default(),
             before: Mutex::default(),
         }
@@ -138,6 +157,10 @@ impl Shadow {
     /// before the submission (a copy per declared range and submission);
     /// a GPU-side dirty mask would save that if big ranges make it slow.
     pub(crate) fn gpu_writes(self: &Arc<Self>, list: &HostList, address: u64, len: u64) {
+        // The direct resource is itself the title memory, including its UAV writes.
+        if self.direct {
+            return;
+        }
         let len = len.min(self.left(address));
         list.defer_gpu_write(self, address as usize, len as usize);
     }
@@ -149,6 +172,9 @@ impl Shadow {
     /// 174 MB heap dozens of times), in reused memory (fresh snapshots cost
     /// ~2.3 million page faults per world frame).
     pub(crate) fn writing(&self, address: usize, len: usize) {
+        if self.direct {
+            return;
+        }
         self.pending
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -188,6 +214,9 @@ impl Shadow {
     /// records (a fence list read as -1, title+0x4e9b54a). Returns the bytes
     /// written.
     pub(crate) fn copy_back(&self, address: usize, len: usize) -> usize {
+        if self.direct {
+            return 0;
+        }
         let mut snapshot = self.before.lock().unwrap_or_else(|e| e.into_inner());
         let mut written = 0;
         let (from, to) = self.inside(address, len);
@@ -263,6 +292,9 @@ impl Shadow {
     /// since it was last copied (all of it if the memory is not
     /// write-watched). Returns the bytes copied.
     pub(crate) fn update(&self, address: usize, len: usize) -> usize {
+        if self.direct {
+            return 0;
+        }
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (address.max(start), (address + len).min(end));
         if from >= to {
@@ -373,6 +405,127 @@ struct Entry {
 /// Title buffers by (start address, resource), with their copy once made.
 static BUFFERS: Mutex<BTreeMap<(u64, usize), Entry>> = Mutex::new(BTreeMap::new());
 
+const RESOURCE_ALIGN: u64 = 1 << 16;
+
+pub(crate) fn inplace_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| matches!(std::env::var("VICTORY_INPLACE").as_deref(), Ok("1")))
+}
+
+fn memory_failure(kind: u32, state: u32) -> Option<InplaceFailure> {
+    if kind == MEM_MAPPED {
+        Some(InplaceFailure::Mapped)
+    } else if kind != MEM_PRIVATE {
+        Some(InplaceFailure::NotPrivate)
+    } else if state != MEM_COMMIT {
+        Some(InplaceFailure::NotCommitted)
+    } else {
+        None
+    }
+}
+
+/// Checks every region covering the complete placed-buffer size.
+fn allocation_for_range(start: u64, size: u64) -> Result<usize, InplaceFailure> {
+    let end = start.checked_add(size).ok_or(InplaceFailure::Query)?;
+    let (mut at, end) = (
+        usize::try_from(start).map_err(|_| InplaceFailure::Query)?,
+        usize::try_from(end).map_err(|_| InplaceFailure::Query)?,
+    );
+    let mut allocation = None;
+    while at < end {
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: `info` is a correctly sized output for a process address query.
+        if unsafe { VirtualQuery(at as *const _, &mut info, size_of::<MEMORY_BASIC_INFORMATION>()) }
+            == 0
+        {
+            return Err(InplaceFailure::Query);
+        }
+        if let Some(failure) = memory_failure(info.Type, info.State) {
+            return Err(failure);
+        }
+        let base = info.AllocationBase as usize;
+        if base == 0 {
+            return Err(InplaceFailure::Query);
+        }
+        if allocation.is_some_and(|old| old != base) {
+            return Err(InplaceFailure::DifferentAllocation);
+        }
+        allocation = Some(base);
+        let region = info.BaseAddress as usize;
+        let next = region
+            .checked_add(info.RegionSize)
+            .ok_or(InplaceFailure::Query)?;
+        if region > at || next <= at {
+            return Err(InplaceFailure::Query);
+        }
+        at = next.min(end);
+    }
+    allocation.ok_or(InplaceFailure::Query)
+}
+
+fn direct_buffer(
+    start: u64,
+    len: u64,
+) -> Result<(ID3D12Resource, u64, Arc<ID3D12Heap>), InplaceFailure> {
+    let size = len
+        .max(1)
+        .checked_add(RESOURCE_ALIGN - 1)
+        .map(|size| size & !(RESOURCE_ALIGN - 1))
+        .ok_or(InplaceFailure::Query)?;
+    let allocation = allocation_for_range(start, size)?;
+    let offset = start
+        .checked_sub(allocation as u64)
+        .ok_or(InplaceFailure::DifferentAllocation)?;
+    if offset % RESOURCE_ALIGN != 0 {
+        return Err(InplaceFailure::Unaligned);
+    }
+    host()
+        .ok_or(InplaceFailure::OpenHeap)?
+        .inplace_buffer(allocation, start, size)
+}
+
+fn fallback(start: u64, len: u64, reason: InplaceFailure) {
+    tracing::warn!(
+        start = format_args!("{start:#x}"),
+        len,
+        reason = ?reason,
+        "in-place buffer unavailable; using the host copy"
+    );
+    #[cfg(feature = "diagnostics")]
+    crate::copystat::add(
+        match reason {
+            InplaceFailure::Query => crate::copystat::C::FallbackQuery,
+            InplaceFailure::Mapped => crate::copystat::C::FallbackMapped,
+            InplaceFailure::NotPrivate => crate::copystat::C::FallbackPrivate,
+            InplaceFailure::NotCommitted => crate::copystat::C::FallbackCommitted,
+            InplaceFailure::DifferentAllocation => crate::copystat::C::FallbackAllocation,
+            InplaceFailure::Unaligned => crate::copystat::C::FallbackAlignment,
+            InplaceFailure::OpenHeap => crate::copystat::C::FallbackHeap,
+            InplaceFailure::PlacedResource => crate::copystat::C::FallbackPlaced,
+        },
+        1,
+    );
+}
+
+fn title_buffer(
+    start: u64,
+    len: u64,
+) -> Option<(ID3D12Resource, *mut u8, u64, Option<Arc<ID3D12Heap>>)> {
+    let size = len.next_multiple_of(RESOURCE_ALIGN);
+    if inplace_enabled() {
+        match direct_buffer(start, len) {
+            Ok((buffer, gpu, heap)) => {
+                return Some((buffer, std::ptr::null_mut(), gpu, Some(heap)));
+            }
+            Err(reason) => fallback(start, len, reason),
+        }
+    }
+    let (buffer, data) = host()?.shared_buffer(size)?;
+    // SAFETY: a live buffer.
+    let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+    Some((buffer, data, gpu, None))
+}
+
 fn buffers() -> std::sync::MutexGuard<'static, BTreeMap<(u64, usize), Entry>> {
     BUFFERS.lock().unwrap_or_else(|e| e.into_inner())
 }
@@ -413,11 +566,15 @@ pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
         let len = entry.end - key.0;
         // Rounded up so that views ending in the buffer's last 256 bytes fit.
         // Shaders write some buffers (unordered access), so not upload memory.
-        let (buffer, data) = host()?.shared_buffer(len.next_multiple_of(1 << 16))?;
+        let (buffer, data, gpu, heap) = title_buffer(key.0, len)?;
         crate::host::name(&buffer, || format!("title buffer {:#x}+{len:#x}", key.0));
-        // SAFETY: a live buffer.
-        let gpu = unsafe { buffer.GetGPUVirtualAddress() };
-        if len >= 16 << 20 {
+        if heap.is_some() {
+            tracing::info!(
+                start = format_args!("{:#x}", key.0),
+                len,
+                "buffer uses title memory in place"
+            );
+        } else if len >= 16 << 20 {
             tracing::info!(
                 start = format_args!("{:#x}", key.0),
                 len,
@@ -430,7 +587,7 @@ pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
                 "buffer copied to the host"
             );
         }
-        entry.shadow = Some(Arc::new(Shadow::new(buffer, data, gpu, key.0, len)));
+        entry.shadow = Some(Arc::new(Shadow::new(buffer, data, gpu, heap, key.0, len)));
     }
     entry.shadow.clone()
 }
@@ -452,16 +609,22 @@ fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
     if let Some(shadow) = map.get(&(start, len)) {
         return Some(shadow.clone());
     }
-    let (buffer, data) = host()?.shared_buffer(len)?;
+    let (buffer, data, gpu, heap) = title_buffer(start, len)?;
     crate::host::name(&buffer, || format!("title memory {start:#x}+{len:#x}"));
-    // SAFETY: a live buffer.
-    let gpu = unsafe { buffer.GetGPUVirtualAddress() };
-    tracing::debug!(
-        start = format_args!("{start:#x}"),
-        len,
-        "loose memory copied to the host"
-    );
-    let shadow = Arc::new(Shadow::new(buffer, data, gpu, start, len));
+    if heap.is_some() {
+        tracing::debug!(
+            start = format_args!("{start:#x}"),
+            len,
+            "loose memory uses title memory in place"
+        );
+    } else {
+        tracing::debug!(
+            start = format_args!("{start:#x}"),
+            len,
+            "loose memory copied to the host"
+        );
+    }
+    let shadow = Arc::new(Shadow::new(buffer, data, gpu, heap, start, len));
     map.insert((start, len), shadow.clone());
     Some(shadow)
 }
@@ -496,4 +659,23 @@ pub(crate) fn near(va: u64) -> String {
         ));
     }
     text
+}
+
+#[cfg(test)]
+mod inplace_tests {
+    use super::{InplaceFailure, memory_failure};
+    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_MAPPED, MEM_PRIVATE};
+
+    #[test]
+    fn only_committed_private_memory_is_eligible() {
+        assert!(memory_failure(MEM_PRIVATE, MEM_COMMIT).is_none());
+        assert!(matches!(
+            memory_failure(MEM_MAPPED, MEM_COMMIT),
+            Some(InplaceFailure::Mapped)
+        ));
+        assert!(matches!(
+            memory_failure(MEM_PRIVATE, 0),
+            Some(InplaceFailure::NotCommitted)
+        ));
+    }
 }

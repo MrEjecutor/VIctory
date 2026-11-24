@@ -37,8 +37,17 @@ pub(crate) enum C {
     TexWatched,
     TexHashed,
     TexChanged,
+    DirectBytes,
+    FallbackQuery,
+    FallbackMapped,
+    FallbackPrivate,
+    FallbackCommitted,
+    FallbackAllocation,
+    FallbackAlignment,
+    FallbackHeap,
+    FallbackPlaced,
 }
-const COUNTERS: usize = 22;
+const COUNTERS: usize = 31;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
 
 pub(crate) fn add(c: C, n: u64) {
@@ -127,6 +136,22 @@ pub(crate) fn log(frames: f64) {
         mb(c[C::TexHashed as usize]),
         mb(c[C::TexChanged as usize]),
     );
+    if crate::shadow::inplace_enabled() {
+        tracing::info!(
+            "in-place per frame: {:.2} MB direct; fallbacks query {:.2}, MEM_MAPPED {:.2}, \
+             non-private {:.2}, uncommitted {:.2}, cross-allocation {:.2}, unaligned {:.2}, \
+             heap-open {:.2}, placed-buffer {:.2}",
+            mb(c[C::DirectBytes as usize]),
+            c[C::FallbackQuery as usize],
+            c[C::FallbackMapped as usize],
+            c[C::FallbackPrivate as usize],
+            c[C::FallbackCommitted as usize],
+            c[C::FallbackAllocation as usize],
+            c[C::FallbackAlignment as usize],
+            c[C::FallbackHeap as usize],
+            c[C::FallbackPlaced as usize],
+        );
+    }
     let ranges = RANGES.lock().unwrap_or_else(|e| e.into_inner()).take();
     let mut ranges: Vec<_> = ranges.into_iter().flatten().collect();
     ranges.sort_by_key(|&(_, (_, bytes, _, _))| std::cmp::Reverse(bytes));
