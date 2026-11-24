@@ -518,7 +518,18 @@ fn title_buffer(
     len: u64,
 ) -> Option<(ID3D12Resource, *mut u8, u64, Option<Arc<ID3D12Heap>>)> {
     let size = len.next_multiple_of(RESOURCE_ALIGN);
-    if inplace_enabled() {
+    // Only big buffers in place (`VICTORY_INPLACE_MIN`, bytes, default 16 MiB):
+    // with every eligible buffer in place the GPU's reads of title memory made
+    // submissions take over 2 s (TDR), while one 90 MB buffer was most of the
+    // private-memory copy time.
+    static MIN: OnceLock<u64> = OnceLock::new();
+    let min = *MIN.get_or_init(|| {
+        std::env::var("VICTORY_INPLACE_MIN")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(16 << 20)
+    });
+    if inplace_enabled() && len >= min {
         match direct_buffer(start, len) {
             Ok((buffer, gpu, heap)) => {
                 return Some((buffer, std::ptr::null_mut(), gpu, Some(heap)));
