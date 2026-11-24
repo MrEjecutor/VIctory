@@ -5788,7 +5788,8 @@ impl<'a> Lower<'a> {
             "image_get_lod" if self.s.pixel => (81, true),
             // Implicit derivatives: pixel shaders only.
             "image_sample_c" if self.s.pixel => (64, true),
-            "image_gather4" | "image_gather4_lz" | "image_gather4_lz_o" => (73, true),
+            "image_gather4" | "image_gather4_lz" | "image_gather4_lz_o" | "image_gather4_l"
+            | "image_gather4_l_o" => (73, true),
             "image_load" | "image_load_mip" => (66, false),
             "image_get_resinfo" => (72, false),
             _ => return Err(name),
@@ -6021,6 +6022,116 @@ impl<'a> Lower<'a> {
                     }
                     if dmask.count_ones() != 1 {
                         return Err("a gather of several channels");
+                    }
+                    if matches!(name, "image_gather4_l" | "image_gather4_l_o") {
+                        if kind == 5 {
+                            return Err("an explicit-level gather of a cube texture");
+                        }
+                        if matches!(kind, 6 | 7) {
+                            return Err("an explicit-level gather of an array texture");
+                        }
+                        if spatial != 2 {
+                            return Err("an explicit-level gather other than a 2D texture");
+                        }
+                        if *d16 {
+                            return Err("a 16-bit explicit-level gather");
+                        }
+
+                        // DXIL's getDimensions reports the level count with
+                        // level zero, then returns the selected level's size.
+                        let z = self.s.m.i32(0);
+                        let dims = self
+                            .s
+                            .m
+                            .named_struct("dx.types.Dimensions", vec![self.s.t.i32; 4]);
+                        let base = self
+                            .s
+                            .op(c, "getDimensions", Attr::ReadOnly, dims, 72, &[h, z]);
+                        let levels = self.s.m.extract(c, base, 3);
+                        let one = self.s.m.i32(1);
+                        let max_level = self.s.m.bin(c, Bin::Sub, levels, one);
+                        let max_level = self.s.m.cast(c, Cast::UiToFp, max_level, self.s.t.f32);
+                        // shortcut: round the requested mip to its nearest
+                        // whole level and clamp it to the texture's range.
+                        let lod = addr_val(self, first + coords)?;
+                        let lod = to_float(self, lod);
+                        let nan = self.s.m.cmp(c, pred::UNO, lod, lod);
+                        let zero_f = self.s.m.f32(0);
+                        let lod = self.s.m.select(c, nan, zero_f, lod);
+                        let lod = self.max_min(true, lod, zero_f);
+                        let lod = self.max_min(false, lod, max_level);
+                        let lod = self.unary(26, lod);
+                        let mip = self.s.m.cast(c, Cast::FpToSi, lod, self.s.t.i32);
+                        let d = self
+                            .s
+                            .op(c, "getDimensions", Attr::ReadOnly, dims, 72, &[h, mip]);
+                        let width = self.s.m.extract(c, d, 0);
+                        let height = self.s.m.extract(c, d, 1);
+                        let width_f = self.s.m.cast(c, Cast::UiToFp, width, self.s.t.f32);
+                        let height_f = self.s.m.cast(c, Cast::UiToFp, height, self.s.t.f32);
+                        let half = self.s.m.f32(0.5f32.to_bits());
+                        let mut x = self.s.m.bin(c, Bin::Mul, cs[0], width_f);
+                        x = self.s.m.bin(c, Bin::Sub, x, half);
+                        let mut y = self.s.m.bin(c, Bin::Mul, cs[1], height_f);
+                        y = self.s.m.bin(c, Bin::Sub, y, half);
+                        let x = self.unary(27, x);
+                        let y = self.unary(27, y);
+                        let mut x = self.s.m.cast(c, Cast::FpToSi, x, self.s.t.i32);
+                        let mut y = self.s.m.cast(c, Cast::FpToSi, y, self.s.t.i32);
+
+                        if offset_word {
+                            let w = addr_val(self, 0)?;
+                            for (k, at) in [(0, 26), (1, 18)] {
+                                // Bits at..at+5 sign-extended: shift up, then down.
+                                let left = self.s.m.i32(at);
+                                let t = self.s.m.bin(c, Bin::Shl, w, left);
+                                let shift = self.s.m.i32(26);
+                                let offset = self.s.m.bin(c, Bin::AShr, t, shift);
+                                if k == 0 {
+                                    x = self.s.m.bin(c, Bin::Add, x, offset);
+                                } else {
+                                    y = self.s.m.bin(c, Bin::Add, y, offset);
+                                }
+                            }
+                        }
+
+                        // shortcut: clamp texels to the selected level's edge.
+                        let zero = self.s.m.i32(0);
+                        let x_max = self.s.m.bin(c, Bin::Sub, width, one);
+                        let y_max = self.s.m.bin(c, Bin::Sub, height, one);
+                        let clamp = |l: &mut Self, v: V, max: V| {
+                            let below = l.s.m.cmp(c, pred::SLT, v, zero);
+                            let v = l.s.m.select(c, below, zero, v);
+                            let above = l.s.m.cmp(c, pred::SGT, v, max);
+                            l.s.m.select(c, above, max, v)
+                        };
+                        let x1_raw = self.s.m.bin(c, Bin::Add, x, one);
+                        let y1_raw = self.s.m.bin(c, Bin::Add, y, one);
+                        let x0 = clamp(self, x, x_max);
+                        let y0 = clamp(self, y, y_max);
+                        let x1 = clamp(self, x1_raw, x_max);
+                        let y1 = clamp(self, y1_raw, y_max);
+                        let gathered = [(x0, y1), (x1, y1), (x1, y0), (x0, y0)];
+                        let channel = dmask.trailing_zeros();
+                        let Operand::Vector { reg, .. } = *data else {
+                            return Err("an image result");
+                        };
+                        for (k, (x, y)) in gathered.into_iter().enumerate() {
+                            let mut args = vec![h, mip, x, y];
+                            args.extend([iu, iu, iu, iu]);
+                            let r = self.s.op(
+                                c,
+                                "textureLoad.f32",
+                                Attr::ReadOnly,
+                                self.s.t.res_ret,
+                                66,
+                                &args,
+                            );
+                            let value = self.s.m.extract(c, r, channel);
+                            let value = self.as_int(value);
+                            self.write(inst, Reg::V(reg + k as u8), value, guard);
+                        }
+                        return Ok(());
                     }
                     if offset_word {
                         let w = addr_val(self, 0)?;
@@ -7035,6 +7146,111 @@ mod tests {
             prims: vec![],
             mesh_stride: 0,
         })
+    }
+
+    fn lower_level_gather(offset: bool) -> Lowered {
+        let mut words = vec![
+            0xBE82_0301, // s_mov_b32 s2, s1
+            0xBE81_0380, // s_mov_b32 s1, 0
+            0xBE83_0380, // s_mov_b32 s3, 0
+            0xF408_0200,
+            0xFA00_0000, // s_load_dwordx4 s[8:11], s[0:1], null
+            0xF40C_0001,
+            0xFA00_0000, // s_load_dwordx8 s[0:7], s[2:3], null
+        ];
+        let literal = |reg: u8, value: u32| {
+            [
+                0x7E00_0000 | (u32::from(reg) << 17) | (1 << 9) | 0xFF,
+                value,
+            ]
+        };
+        if offset {
+            words.extend(literal(2, 0));
+            words.extend(literal(3, 0.5f32.to_bits()));
+            words.extend(literal(4, 0.5f32.to_bits()));
+            words.extend(literal(5, 1.0f32.to_bits()));
+        } else {
+            words.extend(literal(2, 0.5f32.to_bits()));
+            words.extend(literal(3, 0.5f32.to_bits()));
+            words.extend(literal(4, 1.0f32.to_bits()));
+        }
+        words.extend([
+            if offset { 0xF150_0108 } else { 0xF110_0108 },
+            0x0040_0002, // image_gather4_l[_o] v[0:3], v[2:4/5], s[0:7], s[8:11]
+            S_ENDPGM,
+        ]);
+
+        let layout = vec![root(RootType::Table, 0, 0), root(RootType::Table, 1, 1)];
+        let used = vec![
+            UsedResource {
+                kind: ResourceType::Sampler,
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                lower_bound: 0,
+                stride: 0,
+                dwords: 4,
+                user_data: 0,
+                slot: 0,
+            },
+            UsedResource {
+                kind: ResourceType::Srv,
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                lower_bound: 0,
+                stride: 0,
+                dwords: 8,
+                user_data: 1,
+                slot: 1,
+            },
+        ];
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: false,
+            vgprs: 256,
+            layout,
+            used,
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: 2 << 1,
+                threads: [1, 1, 1],
+            }),
+            code,
+        };
+        let p = ir::build(&native.code, false, 256).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        lower(&Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: vec![],
+            outputs: vec![],
+            prims: vec![],
+            mesh_stride: 0,
+        })
+        .unwrap()
+    }
+
+    /// Both forms translate (they were refused before) and the result passes
+    /// the validator when one is installed. That they read the named level
+    /// is checked on the GPU in `gather_level_tests`.
+    #[test]
+    fn explicit_level_gathers_translate_and_validate() {
+        for offset in [false, true] {
+            let lowered = lower_level_gather(offset);
+            #[cfg(windows)]
+            if let Ok(mut v) = super::super::validator::Validator::load(
+                super::super::validator::Validator::default_path().as_deref(),
+            ) {
+                v.validate(&mut lowered.dxil.clone())
+                    .unwrap_or_else(|e| panic!("offset {offset}: {e}"));
+            }
+            #[cfg(not(windows))]
+            let _ = lowered;
+        }
     }
 
     /// Root parameter `slot` in user SGPRs from `user_data` on.
