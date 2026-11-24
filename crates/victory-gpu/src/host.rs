@@ -1977,6 +1977,27 @@ impl Host {
                 heap
             }
         };
+        // A heap opened over existing memory may be a cross-adapter heap, whose
+        // placed resources must say so (else E_INVALIDARG): take its own flags.
+        // SAFETY: a live heap.
+        let heap_desc = unsafe { heap.GetDesc() };
+        {
+            static LOGGED: AtomicU32 = AtomicU32::new(0);
+            if LOGGED.fetch_add(1, Ordering::Relaxed) < 2 {
+                tracing::info!(
+                    size = heap_desc.SizeInBytes,
+                    flags = format_args!("{:#x}", heap_desc.Flags.0),
+                    kind = heap_desc.Properties.Type.0,
+                    cpu_page = heap_desc.Properties.CPUPageProperty.0,
+                    pool = heap_desc.Properties.MemoryPoolPreference.0,
+                    "in-place heap opened"
+                );
+            }
+        }
+        let mut flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+        if heap_desc.Flags.0 & D3D12_HEAP_FLAG_SHARED_CROSS_ADAPTER.0 != 0 {
+            flags |= D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER;
+        }
         let desc = D3D12_RESOURCE_DESC {
             Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
             Width: size.max(1),
@@ -1988,7 +2009,7 @@ impl Host {
                 Quality: 0,
             },
             Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
-            Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+            Flags: flags,
             ..Default::default()
         };
         let mut buffer: Option<ID3D12Resource> = None;
